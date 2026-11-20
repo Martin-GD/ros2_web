@@ -21,7 +21,21 @@
         </div>
         <form v-if="selected" id="wifi-connect-form" class="wifi-form" @submit.prevent="connect">
           <p>已选择：<strong>{{ selected.ssid }}</strong></p>
-          <template v-if="needsPassword">
+          <template v-if="enterprise">
+            <p class="hint">校园网认证：PEAP · 阶段 2：MSCHAPv2 · CA 证书：不验证。</p>
+            <label v-if="selected.saved" class="wifi-saved-choice"><input v-model="useSavedEnterprise" type="checkbox" :disabled="connecting" @change="clearCredentials" />使用已保存的校园网账号和密码</label>
+            <template v-if="!reuseEnterprise">
+              <label for="wifi-identity">用户名（完整邮箱）</label>
+              <input id="wifi-identity" v-model.trim="identity" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" maxlength="253" required :disabled="connecting" placeholder="学号@mail.sustech.edu.cn" />
+              <p class="hint">学生：学号@mail.sustech.edu.cn；教职工：账号@sustech.edu.cn。</p>
+              <label for="wifi-anonymous-identity">匿名身份（可选）</label>
+              <input id="wifi-anonymous-identity" v-model.trim="anonymousIdentity" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="253" :disabled="connecting" placeholder="学校未要求时留空" />
+              <label for="wifi-enterprise-password">eduroam 系统登录密码</label>
+              <input id="wifi-enterprise-password" v-model="password" type="password" autocomplete="new-password" maxlength="1024" required :disabled="connecting" placeholder="输入 eduroam 密码，不是 CAS 登录密码" />
+              <p class="hint">尚未设置密码？在校园网内打开 <a href="https://wxrz.sustech.edu.cn/" target="_blank" rel="noopener noreferrer">无线认证注册页</a>，通过 CAS 注册并设置 eduroam 密码。</p>
+            </template>
+          </template>
+          <template v-else-if="needsPassword">
             <label for="wifi-password">Wi-Fi 密码{{ selected.saved ? '（已保存，可留空）' : '' }}</label>
             <input id="wifi-password" v-model="password" type="password" autocomplete="new-password" maxlength="64" :required="!selected.saved" :disabled="connecting" :placeholder="selected.saved ? '留空使用已保存的密码' : '输入 Wi-Fi 密码'" />
           </template>
@@ -31,7 +45,7 @@
         <p class="hint">切换 Wi-Fi 后，此页面可能断开。请让手机或电脑连接同一网络，再用设备的新 IP 打开页面。</p>
         <p v-if="ethernetUrl" class="hint">也可连接设备网线，在同一有线网段访问 <a :href="ethernetUrl">{{ ethernetUrl }}</a>。</p>
       </div>
-      <footer><button class="primary" type="submit" form="wifi-connect-form" :disabled="!selected || scanning || connecting">{{ connecting ? '正在连接…' : selected?.connected && !password ? '确认当前连接' : '连接 Wi-Fi' }}</button><button type="button" class="secondary" @click="close">收起</button></footer>
+      <footer><button class="primary" type="submit" form="wifi-connect-form" :disabled="!selected || scanning || connecting">{{ connecting ? '正在连接…' : '连接 Wi-Fi' }}</button><button type="button" class="secondary" @click="close">收起</button></footer>
     </dialog>
   </Teleport>
 </template>
@@ -41,7 +55,10 @@ import { ref, computed, nextTick, onMounted, onBeforeUnmount } from 'vue'
 const emit = defineEmits(['open'])
 const status = ref(null), statusError = ref(false), dialog = ref(null), opened = ref(false)
 const networks = ref([]), selected = ref(null), password = ref(''), scanning = ref(false), connecting = ref(false)
+const identity = ref(''), anonymousIdentity = ref(''), useSavedEnterprise = ref(false)
 const message = ref(''), isError = ref(false)
+const enterprise = computed(() => selected.value?.mode === 'wpa-eap')
+const reuseEnterprise = computed(() => enterprise.value && selected.value?.saved && useSavedEnterprise.value)
 const needsPassword = computed(() => ['wpa-psk', 'sae'].includes(selected.value?.mode))
 const ethernetUrl = computed(() => status.value?.ethernet_ipv4?.[0] ? `${window.location.protocol}//${status.value.ethernet_ipv4[0]}:${window.location.port || '5173'}` : '')
 const endpoint = `${window.location.protocol}//${window.location.hostname}:3000/api/wifi`
@@ -64,12 +81,13 @@ async function open() {
   if (!connecting.value) await scan()
 }
 function close() { dialog.value?.close() }
-function closed() { password.value = ''; opened.value = false }
-function select(network) { selected.value = network; password.value = ''; message.value = ''; isError.value = false }
+function clearCredentials() { password.value = ''; identity.value = ''; anonymousIdentity.value = '' }
+function closed() { clearCredentials(); opened.value = false }
+function select(network) { selected.value = network; clearCredentials(); useSavedEnterprise.value = !!network.saved; message.value = ''; isError.value = false }
 async function scan() {
   if (scanning.value || connecting.value) return
-  scanning.value = true; message.value = ''; isError.value = false; password.value = ''; selected.value = null
-  try { const result = await request('/scan', {}, 35000); networks.value = result.networks; selected.value = networks.value.find(n => n.connected && n.supported) || null }
+  scanning.value = true; message.value = ''; isError.value = false; clearCredentials(); selected.value = null
+  try { const result = await request('/scan', {}, 35000); networks.value = result.networks; const current = networks.value.find(n => n.connected && n.supported); if (current) select(current) }
   catch (error) { networks.value = []; message.value = error.name === 'TimeoutError' || error instanceof TypeError ? '扫描失败，请检查设备连接后重试。' : error.message; isError.value = true }
   finally { scanning.value = false }
 }
@@ -85,7 +103,7 @@ async function pollJob(id, started) {
     if (result.job.state !== 'connecting') { finish(result.job); return }
     message.value = result.job.message
   } catch { message.value = '正在切换网络，暂时无法访问设备。若网络已改变，请使用设备的新 IP 重新打开页面。' }
-  if (Date.now() - started > 110000) {
+  if (Date.now() - started > 180000) {
     connecting.value = false; isError.value = true; message.value = '暂时无法确认连接结果，请查看顶部 Wi-Fi 状态；若设备 IP 已改变，请用新 IP 访问。'; return
   }
   jobTimer = setTimeout(() => pollJob(id, started), 2000)
@@ -93,17 +111,18 @@ async function pollJob(id, started) {
 async function connect() {
   if (!selected.value || connecting.value) return
   connecting.value = true; isError.value = false; message.value = '正在提交连接请求…'
-  const body = { ssid: selected.value.ssid, bssid: selected.value.bssid, password: password.value }
-  password.value = ''
+  const body = { ssid: selected.value.ssid, bssid: selected.value.bssid, password: reuseEnterprise.value ? '' : password.value }
+  if (enterprise.value && !reuseEnterprise.value) { body.identity = identity.value; body.anonymous_identity = anonymousIdentity.value }
+  clearCredentials()
   try {
     const result = await request('/connect', body, 35000)
     if (result.job.state === 'connecting') { message.value = result.job.message; pollJob(result.job.id, Date.now()) }
     else finish(result.job)
   } catch (error) { connecting.value = false; isError.value = true; message.value = error instanceof TypeError || error.name === 'TimeoutError' ? '设备暂时无法访问，连接请求可能已提交。请检查当前网络或使用设备的新 IP 访问。' : error.message }
-  finally { body.password = '' }
+  finally { body.password = ''; body.identity = ''; body.anonymous_identity = '' }
 }
 onMounted(pollStatus)
-onBeforeUnmount(() => { stopped = true; clearTimeout(statusTimer); clearTimeout(jobTimer); password.value = '' })
+onBeforeUnmount(() => { stopped = true; clearTimeout(statusTimer); clearTimeout(jobTimer); clearCredentials() })
 </script>
 
 <style scoped>
@@ -128,6 +147,9 @@ h2 { margin:0; font-size:21px; } header p { margin:6px 0 0; color:#64748b; font-
 .badge { font-size:11px; border-radius:4px; padding:2px 5px; color:#047857; background:#d1fae5; }.badge.saved { color:#475569; background:#e2e8f0; }
 .wifi-form { margin-top:18px; padding-top:4px; } label { display:block; font-size:14px; margin-bottom:8px; }
 input { box-sizing:border-box; width:100%; padding:11px; border:1px solid #cbd5e1; border-radius:8px; font:inherit; }
+.wifi-form input + label { margin-top:14px; }
+.wifi-saved-choice { display:flex; align-items:center; gap:8px; margin:12px 0; }
+.wifi-saved-choice input { width:auto; padding:0; }
 .hint { font-size:12px; line-height:1.7; color:#64748b; overflow-wrap:anywhere; } a { color:#2563eb; }
 .wifi-result { padding:12px; border-radius:8px; font-size:14px; line-height:1.6; color:#065f46; background:#ecfdf5; overflow-wrap:anywhere; }.wifi-result.error { color:#b91c1c; background:#fef2f2; }
 footer { display:flex; justify-content:flex-end; gap:10px; padding:16px 20px; border-top:1px solid #e2e8f0; }

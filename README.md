@@ -10,6 +10,7 @@
 
 ## 核心功能
 
+* RK / ARM 版支持普通 Wi-Fi 与校园网 802.1X（PEAP + MSCHAPv2）配网，详见 [Wi-Fi 设置与 RK 更新步骤](Ros_Vue_arm/WIFI.md)。
 * 实时 SLAM 栅格地图显示。
 * 机器人摇杆远程控制。
 * 电池电压与里程计数据实时监测。

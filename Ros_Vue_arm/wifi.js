@@ -21,7 +21,8 @@ export function splitNmcli(line) {
 }
 export function securityMode(security) {
   if (!security || security === '--') return 'open';
-  if (/802\.1X|EAP|WEP/i.test(security)) return 'unsupported';
+  if (/WEP/i.test(security)) return 'unsupported';
+  if (/802\.1X|EAP/i.test(security)) return 'wpa-eap';
   if (/WPA[12]?\b/.test(security)) return 'wpa-psk';
   if (/WPA3/.test(security)) return 'sae';
   if (/OWE/.test(security)) return 'owe';
@@ -43,25 +44,52 @@ export function parseNetworks(text) {
 function keyString(value) {
   return value.replace(/\\/g, '\\\\').replace(/ /g, '\\s').replace(/\n/g, '\\n').replace(/\r/g, '\\r').replace(/\t/g, '\\t');
 }
-export function profileText({ uuid, iface, ssid, password, mode }) {
+export function profileText({ uuid, iface, ssid, password, mode, identity = '', anonymous_identity = '' }) {
   // SSIDs use the documented byte-array keyfile format; passwords never enter argv.
   const ssidBytes = [...Buffer.from(ssid, 'utf8')].join(';') + ';';
-  const security = mode === 'open' ? '' : `\n[wifi-security]\nkey-mgmt=${mode}\n${mode === 'owe' ? '' : `psk=${keyString(password)}\npsk-flags=0\n`}${mode === 'sae' || mode === 'owe' ? 'pmf=3\n' : ''}`;
+  const enterprise = mode === 'wpa-eap';
+  const settings = mode === 'open' ? [] : ['', '[wifi-security]', `key-mgmt=${mode}`];
+  if (['wpa-psk', 'sae'].includes(mode)) settings.push(`psk=${keyString(password)}`, 'psk-flags=0');
+  if (mode === 'sae' || mode === 'owe') settings.push('pmf=3');
+  if (enterprise) {
+    settings.push('', '[802-1x]', 'eap=peap;', `identity=${keyString(identity)}`);
+    if (anonymous_identity) settings.push(`anonymous-identity=${keyString(anonymous_identity)}`);
+    // School-provided "do not validate" mode; no CA path, pinning or TOFU.
+    settings.push('phase2-auth=mschapv2', `password=${keyString(password)}`, 'password-flags=0', 'system-ca-certs=false', 'auth-timeout=60');
+  }
+  const security = settings.length ? settings.join('\n') + '\n' : '';
   return `[connection]\nid=ros2-web-${uuid}\nuuid=${uuid}\ntype=wifi\ninterface-name=${iface}\nautoconnect=false\n\n[wifi]\nmode=infrastructure\nssid=${ssidBytes}\n${mode === 'open' ? '' : 'security=802-11-wireless-security\n'}${security}\n[ipv4]\nmethod=auto\n\n[ipv6]\nmethod=auto\n`;
 }
 export function validateInput(body) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) throw fault('连接参数无效');
-  const { ssid, bssid = '', password = '' } = body;
+  const { ssid, bssid = '', password = '', identity = '', anonymous_identity = '' } = body;
   if (typeof ssid !== 'string' || Buffer.byteLength(ssid) < 1 || Buffer.byteLength(ssid) > 32 || /[\x00-\x1f\x7f]/.test(ssid)) throw fault('Wi-Fi 名称必须为 1～32 字节');
   if (typeof bssid !== 'string' || (bssid && !/^(?:[\da-f]{2}:){5}[\da-f]{2}$/i.test(bssid))) throw fault('请重新扫描并选择 Wi-Fi');
-  if (typeof password !== 'string' || /[\x00-\x1f\x7f]/.test(password) || (password && !((Buffer.byteLength(password) >= 8 && Buffer.byteLength(password) <= 63) || /^[\da-f]{64}$/i.test(password)))) throw fault('Wi-Fi 密码需为 8～63 字节，或 64 位十六进制密钥');
-  return { ssid, bssid, password };
+  if (typeof password !== 'string' || /[\x00-\x1f\x7f]/.test(password) || Buffer.byteLength(password) > 1024) throw fault('密码不能包含控制字符，且不能超过 1024 字节');
+  for (const value of [identity, anonymous_identity]) {
+    if (typeof value !== 'string' || /[\x00-\x1f\x7f]/.test(value) || Buffer.byteLength(value) > 253) throw fault('用户名和匿名身份不能包含控制字符，且不能超过 253 字节');
+  }
+  return { ssid, bssid, password, identity: identity.trim(), anonymous_identity: anonymous_identity.trim() };
+}
+const hasCredentials = input => !!(input.password || input.identity || input.anonymous_identity);
+export function validateCredentials(input, network) {
+  if (network.mode === 'wpa-eap') {
+    if (!hasCredentials(input) && network.saved_uuid) return;
+    if (!input.identity) throw fault('请输入校园网用户名（完整邮箱）');
+    if (!input.password) throw fault('请输入 eduroam 系统登录密码；修改账号时也需要重新填写密码');
+  } else {
+    if (input.identity || input.anonymous_identity) throw fault('当前网络不是 802.1X 网络，请重新选择 Wi-Fi');
+    if (['wpa-psk', 'sae'].includes(network.mode)) {
+      if (!input.password && !network.saved_uuid) throw fault('请输入 Wi-Fi 密码');
+      if (input.password && !((Buffer.byteLength(input.password) >= 8 && Buffer.byteLength(input.password) <= 63) || /^[\da-f]{64}$/i.test(input.password))) throw fault('Wi-Fi 密码需为 8～63 字节，或 64 位十六进制密钥');
+    } else if (input.password) throw fault('此网络无需密码');
+  }
 }
 export class WifiManager {
   constructor(options = {}) {
     this.run = options.run || (async (args, timeout = 12000) => {
       try { return (await exec('/usr/bin/nmcli', args, { timeout, maxBuffer: 512 * 1024, env: { ...process.env, LC_ALL: 'C.UTF-8', LANG: 'C.UTF-8' } })).stdout; }
-      catch { throw fault('网络操作失败，请检查 Wi-Fi 信号和密码', 503); }
+      catch { throw fault('网络操作失败，请检查 Wi-Fi 信号、账号和密码', 503); }
     });
     this.profileDir = options.profileDir || '/etc/NetworkManager/system-connections';
     this.interfaces = options.interfaces || os.networkInterfaces;
@@ -96,7 +124,12 @@ export class WifiManager {
     const profiles = [];
     for (const [uuid, type] of rows) {
       if (!['wifi', '802-11-wireless'].includes(type)) continue;
-      try { profiles.push({ uuid, ssid: trimLine(await this.run(['--escape', 'no', '-g', '802-11-wireless.ssid', 'connection', 'show', 'uuid', uuid])) }); } catch { /* Profile may have been removed. */ }
+      try {
+        const ssid = trimLine(await this.run(['--escape', 'no', '-g', '802-11-wireless.ssid', 'connection', 'show', 'uuid', uuid]));
+        const keyMgmt = trimLine(await this.run(['-g', '802-11-wireless-security.key-mgmt', 'connection', 'show', 'uuid', uuid]));
+        const mode = !keyMgmt || keyMgmt === '--' ? 'open' : keyMgmt;
+        profiles.push({ uuid, ssid, mode });
+      } catch { /* Profile may have been removed. */ }
     }
     return profiles;
   }
@@ -104,7 +137,10 @@ export class WifiManager {
     const iface = await this.device();
     const text = await this.run(['-t', '--escape', 'yes', '-f', 'IN-USE,SSID,BSSID,SIGNAL,SECURITY,FREQ', 'device', 'wifi', 'list', 'ifname', iface, '--rescan', rescan ? 'yes' : 'no'], 25000);
     const saved = await this.savedProfiles();
-    return { interface: iface, networks: parseNetworks(text).map(network => ({ ...network, saved_uuid: saved.find(p => p.ssid === network.ssid)?.uuid || '', saved: saved.some(p => p.ssid === network.ssid) })) };
+    return { interface: iface, networks: parseNetworks(text).map(network => {
+      const profile = saved.find(p => p.ssid === network.ssid && p.mode === network.mode);
+      return { ...network, saved_uuid: profile?.uuid || '', saved: !!profile };
+    }) };
   }
   async scan() {
     if (this.busy) throw fault('正在连接 Wi-Fi，请稍候再扫描', 409);
@@ -120,22 +156,22 @@ export class WifiManager {
       const available = await this.list(false);
       const network = available.networks.find(n => n.ssid === input.ssid && (!input.bssid || n.bssid.toLowerCase() === input.bssid.toLowerCase()));
       if (!network) throw fault('没有找到该 Wi-Fi，请重新扫描');
-      if (!network.supported) throw fault('暂不支持 WEP 或企业认证网络，请选择个人 Wi-Fi');
-      if (['wpa-psk', 'sae'].includes(network.mode) && !input.password && !network.saved_uuid) throw fault('请输入 Wi-Fi 密码');
+      if (!network.supported) throw fault('暂不支持该认证方式；校园网请使用 PEAP / MSCHAPv2 网络');
+      validateCredentials(input, network);
       const job = { id: randomUUID(), ssid: input.ssid, state: 'connecting', message: '正在连接 Wi-Fi…', started_at: Date.now(), network: null };
       this.jobs.set(job.id, job);
       if (this.jobs.size > 20) this.jobs.delete(this.jobs.keys().next().value);
-      if (before.connected && before.ssid === input.ssid && !input.password) {
+      if (before.connected && before.ssid === input.ssid && !hasCredentials(input)) {
         Object.assign(job, { state: 'succeeded', message: '当前已连接该 Wi-Fi', network: before }); this.busy = false;
       } else {
         // Return 202 before switching the interface used by this HTTP request.
         setTimeout(() => { this.perform(job, input, network, before).finally(() => { this.busy = false; this.cachedAt = 0; }); }, 150);
       }
       return { ...job };
-    } catch (error) { this.busy = false; throw error; }
+    } catch (error) { input.password = ''; this.busy = false; throw error; }
   }
   async perform(job, input, network, before) {
-    const reuse = network.saved_uuid && !input.password;
+    const reuse = network.saved_uuid && !hasCredentials(input);
     const uuid = reuse ? network.saved_uuid : randomUUID();
     const file = reuse ? null : path.join(this.profileDir, `ros2-web-${uuid}.nmconnection`);
     try {
@@ -144,7 +180,8 @@ export class WifiManager {
         await fs.writeFile(file, profileText({ uuid, iface: before.interface, ...input, mode: network.mode }), { mode: 0o600, flag: 'wx' });
         await this.run(['connection', 'load', file]);
       }
-      await this.run(['--wait', '40', 'connection', 'up', 'uuid', uuid, 'ifname', before.interface], 50000);
+      const enterprise = network.mode === 'wpa-eap';
+      await this.run(['--wait', enterprise ? '90' : '40', 'connection', 'up', 'uuid', uuid, 'ifname', before.interface], enterprise ? 100000 : 50000);
       const after = await this.readStatus();
       if (!after.connected || after.uuid !== uuid || !after.ipv4.length) throw new Error('No IPv4 lease');
       await this.run(['connection', 'modify', 'uuid', uuid, 'connection.autoconnect', 'yes', ...(file ? ['connection.autoconnect-priority', '10'] : [])]);
@@ -165,8 +202,9 @@ export class WifiManager {
           restored = current.connected && current.uuid === before.uuid && current.ipv4.length > 0;
         } catch { /* Report rollback failure without exposing subprocess output. */ }
       }
-      Object.assign(job, { state: 'failed', restored, message: restored ? '连接失败，已恢复原 Wi-Fi。请检查密码和信号后重试。' : '连接失败，请检查密码和信号。若页面断开，可通过有线网络重新访问。' });
-    } finally { input.password = ''; job.finished_at = Date.now(); }
+      const hint = network.mode === 'wpa-eap' ? '请检查完整邮箱账号、eduroam 密码和信号（不是 CAS 密码）。' : '请检查密码和信号。';
+      Object.assign(job, { state: 'failed', restored, message: restored ? `连接失败，已恢复原 Wi-Fi。${hint}` : `连接失败，${hint}若页面断开，可通过有线网络重新访问。` });
+    } finally { input.password = ''; input.identity = ''; input.anonymous_identity = ''; job.finished_at = Date.now(); }
   }
 }
 export function installWifi(app, manager = new WifiManager()) {
